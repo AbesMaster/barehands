@@ -51,6 +51,8 @@ Your AI drives the ring by writing tiny files into ./state/ :
 Missing files are fine — the ring just idles.
 """
 import json
+import secrets
+import threading
 import time
 import urllib.parse
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -126,6 +128,29 @@ _ALLOWED = ("add_img", "add_card", "clear", "reset", "hand", "give",
             "yank", "hover", "scroll_note", "widget", "explode", "assemble",
             "present")
 
+# ---- TAP-TO-APPROVE (Stage 1 safety gate) --------------------------------
+# The agent's tier-guard hook asks here before any RED action. Two cards
+# appear on the glass: APPROVE and DENY. Only a hand tap on the page can
+# answer, because the one-time nonce travels to the PAGE inside the card
+# command and is never returned to the asker. No answer in _APPR_TTL
+# seconds = denied. Fail-closed by design.
+_APPR = {}                      # id -> {"nonce", "state", "t"}
+_APPR_LOCK = threading.Lock()
+_APPR_TTL = 90
+
+
+def _appr_gc():
+    now = time.time()
+    for k in [k for k, v in _APPR.items() if now - v["t"] > _APPR_TTL * 4]:
+        _APPR.pop(k, None)
+    for k, v in _APPR.items():
+        if v["state"] == "pending" and now - v["t"] > _APPR_TTL:
+            v["state"] = "expired"
+            # Clear its cards here too. The asker's /approval/cancel is the
+            # normal path, but an asker that gets killed never sends it, and
+            # its cards then sat on the glass forever (and drifted off it).
+            _CMDS.append({"a": "approval_clear", "id": k})
+
 
 class Handler(SimpleHTTPRequestHandler):
     def translate_path(self, path):
@@ -178,6 +203,8 @@ class Handler(SimpleHTTPRequestHandler):
         if self.path == "/state":
             # the tracker's heartbeat doubles as the command channel
             _STATE = body
+            with _APPR_LOCK:
+                _appr_gc()   # expire stale approvals between requests, not only on the next one
             out = json.dumps(_CMDS[:8]).encode()
             del _CMDS[:8]
             self.send_response(200)
@@ -185,6 +212,69 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_header("Content-Length", str(len(out)))
             self.end_headers()
             self.wfile.write(out)
+            return
+        if self.path in ("/approval/request", "/approval/decide",
+                         "/approval/cancel"):
+            try:
+                req = json.loads(body or b"{}")
+            except Exception:
+                req = {}
+            code, out = 400, None
+            with _APPR_LOCK:
+                _appr_gc()
+                if self.path == "/approval/request":
+                    live = [v for v in _APPR.values()
+                            if v["state"] == "pending"]
+                    if len(live) >= 5:
+                        code = 429
+                    else:
+                        aid = secrets.token_hex(4)
+                        nonce = secrets.token_hex(16)
+                        _APPR[aid] = {"nonce": nonce, "state": "pending",
+                                      "t": time.time()}
+                        summ = str(req.get("summary", ""))[:160]
+                        _CMDS.append({"a": "add_card", "title": "APPROVE",
+                                      "body": summ, "x": 0.36, "y": 0.5,
+                                      "approval": {"id": aid, "nonce": nonce,
+                                                   "decision": "approve"}})
+                        _CMDS.append({"a": "add_card", "title": "DENY",
+                                      "body": "tap to refuse", "x": 0.64,
+                                      "y": 0.5,
+                                      "approval": {"id": aid, "nonce": nonce,
+                                                   "decision": "deny"}})
+                        code, out = 200, {"id": aid}
+                elif self.path == "/approval/decide":
+                    rec = _APPR.get(str(req.get("id", "")))
+                    dec = req.get("decision")
+                    if (rec and rec["state"] == "pending"
+                            and dec in ("approve", "deny")
+                            and secrets.compare_digest(
+                                rec["nonce"], str(req.get("nonce", "")))):
+                        rec["state"] = "approved" if dec == "approve" \
+                            else "denied"
+                        _CMDS.append({"a": "approval_clear",
+                                      "id": str(req["id"])})
+                        code = 204
+                    else:
+                        code = 403
+                else:   # cancel (the asker gave up / timed out)
+                    rec = _APPR.get(str(req.get("id", "")))
+                    if rec:
+                        if rec["state"] == "pending":
+                            rec["state"] = "expired"
+                        _CMDS.append({"a": "approval_clear",
+                                      "id": str(req["id"])})
+                    code = 204
+            if out is not None:
+                data = json.dumps(out).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            else:
+                self.send_response(code)
+                self.end_headers()
             return
         if self.path == "/cmd":
             try:
@@ -220,6 +310,14 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        if self.path.startswith("/approval/status"):
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            with _APPR_LOCK:
+                _appr_gc()
+                rec = _APPR.get((q.get("id") or [""])[0])
+                st = rec["state"] if rec else "unknown"
+            self._json({"state": st})
+            return
         if self.path == "/config":
             # the page builds its ring name + orb bloom from this
             self._json({"name": CONFIG.get("name", "Assistant"),

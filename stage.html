@@ -348,6 +348,10 @@ function makeCard(def) {
   const el = document.createElement("div");
   el.className = "card";
   el.innerHTML = `<h3>${escT(def.title)}</h3><p>${escT(def.body || "")}</p>`;
+  if (def.approval) {   // Stage 1 safety gate: tap-to-approve cards
+    el.style.borderColor = def.approval.decision === "approve" ? "#d4af37" : "#c0392b";
+    el.style.boxShadow = "0 0 28px " + (def.approval.decision === "approve" ? "#d4af3788" : "#c0392b88");
+  }
   BEHIND.appendChild(el);
   return { el, id: UID++, type: "card", def, x: 0, y: 0, scale: 1, vx: 0, vy: 0,
            grabbedBy: [], ox: 0, oy: 0, flying: false, stretch: null };
@@ -1196,7 +1200,7 @@ function applyCmds(cmds) {
       // jail governs, so only configured notes folders resolve).
       // open:1 = unfurl the panel immediately instead of the card.
       const it = makeCard({ title: c.title, body: c.body || "",
-                            file: c.file || "" });
+                            file: c.file || "", approval: c.approval || null });
       if (c.hand) deliver(it);
       else {
         // Optional x/y, as 0..1 fractions of the viewport -- the same
@@ -1212,6 +1216,9 @@ function applyCmds(cmds) {
       }
       items.push(it);
       if (c.open && it.def.file) openPanel(it);
+    } else if (c.a === "approval_clear") {
+      items.filter(k => k.type === "card" && k.def && k.def.approval &&
+                        k.def.approval.id === c.id).forEach(killItem);
     } else if (c.a === "widget") {
       summonWidget(c.w || "ring");
     } else if (c.a === "scroll_note") {
@@ -1802,6 +1809,20 @@ function endGrab(c, i, cur) {
       const tTrav = Math.hypot(cur.x - (c.tapX || cur.x),
                                cur.y - (c.tapY || cur.y));
       if (tMs < 300 && tTrav < 26) openPanel(c);
+    }
+    // STAGE 1 SAFETY GATE: a real hand tap on an APPROVE/DENY card answers
+    // the tier-guard. Same quick near-still gate as every other tap, and a
+    // fresh force-pull catch can't count. The nonce lives only in the card.
+    if (c.type === "card" && c.def.approval && !pullFresh) {
+      const aMs = performance.now() - (cur.grabT || 0);
+      const aTr = Math.hypot(cur.x - (c.tapX || cur.x),
+                             cur.y - (c.tapY || cur.y));
+      if (aMs < 300 && aTr < 26) {
+        const ap = c.def.approval;
+        fetch("/approval/decide", { method: "POST",
+          body: JSON.stringify({ id: ap.id, nonce: ap.nonce,
+                                 decision: ap.decision }) }).catch(() => {});
+      }
     }
     // GESTURE v3.1 (2026-08-14, the crush is DEAD — "that is happening
     // too naturally"): THE TAP IS SYMMETRIC — tap opens closed things,
