@@ -141,8 +141,11 @@ _APPR_TTL = 90
 
 def _appr_gc():
     now = time.time()
-    for k in [k for k, v in _APPR.items() if now - v["t"] > _APPR_TTL * 4]:
-        _APPR.pop(k, None)
+    # Expire BEFORE purging. This sweep only runs on the tracker's heartbeat,
+    # and Chrome pauses that while the board window is hidden; when it comes
+    # back, a request can already be past the purge age. Purging first
+    # dropped such a still-pending record without ever queuing its clear,
+    # so its cards stayed on the glass for good.
     for k, v in _APPR.items():
         if v["state"] == "pending" and now - v["t"] > _APPR_TTL:
             v["state"] = "expired"
@@ -150,6 +153,8 @@ def _appr_gc():
             # normal path, but an asker that gets killed never sends it, and
             # its cards then sat on the glass forever (and drifted off it).
             _CMDS.append({"a": "approval_clear", "id": k})
+    for k in [k for k, v in _APPR.items() if now - v["t"] > _APPR_TTL * 4]:
+        _APPR.pop(k, None)
 
 
 class Handler(SimpleHTTPRequestHandler):
